@@ -1,140 +1,236 @@
 import asyncio
 import json
 import websockets
+import aiohttp
 import csv
-import requests
+from collections import deque
 from datetime import datetime
 
-class TelegramFrictionMonitor:
-    def __init__(self, symbol: str = "btcusdt", threshold_a: float = 0.29213, cooldown_seconds: int = 60):
+class FrictionTradingBot:
+    def __init__(
+        self,
+        symbol: str = "btcusdt",
+        threshold_a: float = 0.29213,
+        cooldown_seconds: int = 30,
+        initial_balance: float = 1000.0,
+        tp_pct: float = 0.0025,   # Take Profit: 0.25%
+        sl_pct: float = 0.0015,   # Stop Loss: 0.15%
+        fee_pct: float = 0.001    # Binance Spot Fee: 0.1%
+    ):
         self.symbol = symbol.lower()
         self.threshold_a = threshold_a
-        self.baseline_depth = None
         self.ws_url = f"wss://stream.binance.com:9443/ws/{self.symbol}@depth20@100ms"
-        
-        # Log files
+
+        # Rolling window for liquidity (last 500 snapshots = ~50 seconds)
+        self.depth_window = deque(maxlen=500)
+
+        # Logging and CSV Buffer (to avoid disk I/O lag every 100ms)
         self.history_log = f"friction_history_{self.symbol}.csv"
-        self.alert_log = f"panic_alerts_{self.symbol}.log"
-        
-        # Cooldown anti-spam configuration
+        self.trades_log = f"paper_trades_{self.symbol}.csv"
+        self.csv_buffer = []
+        self.buffer_limit = 50
+
+        # Anti-spam
         self.cooldown_seconds = cooldown_seconds
         self.last_alert_time = None
-        
-        # Telegram configuration
+
+        # Telegram
         self.TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
         self.CHAT_ID = "YOUR_CHAT_ID"
-        self.use_telegram = False  # Set to True after configuring your token and chat ID
-        
-        self.init_history_csv()
+        self.use_telegram = False
 
-    def init_history_csv(self):
-        """Initializes the CSV history log file with headers."""
+        # Virtual Portfolio (Paper Trading)
+        self.balance = initial_balance
+        self.position = None  # Dict: {'side': 'LONG'/'SHORT', 'entry': float, 'size': float}
+        self.tp_pct = tp_pct
+        self.sl_pct = sl_pct
+        self.fee_pct = fee_pct
+        self.total_trades = 0
+        self.winning_trades = 0
+
+        self.init_logs()
+
+    def init_logs(self):
         with open(self.history_log, mode='w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(["Timestamp", "Symbol", "BidVol", "AskVol", "Asymmetry", "A_t", "Status"])
+            writer.writerow(["Timestamp", "Symbol", "MidPrice", "BidVol", "AskVol", "SignedAsym", "A_t", "Signal"])
 
-    def log_to_csv(self, timestamp, bid_vol, ask_vol, c_sync, a_t, status):
-        """Appends a new record to the CSV history file."""
+        with open(self.trades_log, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Side", "EntryPrice", "ExitPrice", "Reason", "PnL_USDT", "Balance"])
+
+    def flush_csv_buffer(self):
+        if not self.csv_buffer:
+            return
         with open(self.history_log, mode='a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow([timestamp, self.symbol.upper(), f"{bid_vol:.2f}", f"{ask_vol:.2f}", f"{c_sync:.4f}", f"{a_t:.4f}", status])
+            writer.writerows(self.csv_buffer)
+        self.csv_buffer.clear()
 
-    def send_telegram_message(self, message: str):
-        """Sends an alert message via Telegram API."""
+    def log_trade(self, timestamp, side, entry, exit_price, reason, pnl):
+        with open(self.trades_log, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([timestamp, side, f"{entry:.2f}", f"{exit_price:.2f}", reason, f"{pnl:.4f}", f"{self.balance:.2f}"])
+
+    async def send_telegram_message(self, session: aiohttp.ClientSession, message: str):
         if not self.use_telegram:
             return
+        url = f"https://api.telegram.org/bot{self.TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": self.CHAT_ID, "text": message, "parse_mode": "Markdown"}
         try:
-            url = f"https://api.telegram.org/bot{self.TELEGRAM_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": self.CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown"
-            }
-            requests.post(url, json=payload, timeout=3)
+            async with session.post(url, json=payload, timeout=3) as resp:
+                if resp.status != 200:
+                    print(f"\n[Telegram Warning]: Status {resp.status}")
         except Exception as e:
             print(f"\n[Telegram Error]: {e}")
 
-    def trigger_alert(self, current_dt: datetime, timestamp_str: str, a_t: float, c_sync: float):
-        """Triggers the alert mechanism respecting the cooldown period."""
-        if self.last_alert_time is not None:
-            elapsed = (current_dt - self.last_alert_time).total_seconds()
-            if elapsed < self.cooldown_seconds:
-                return  # Suppressed by cooldown
+    def manage_paper_position(self, current_price: float, timestamp_str: str):
+        """Checks if the active position has reached Take Profit or Stop Loss."""
+        if not self.position:
+            return
 
-        self.last_alert_time = current_dt
+        side = self.position['side']
+        entry = self.position['entry']
+        size = self.position['size']
 
-        alert_message = (
-            f"🚨 *PANIC JAMMING DETECTED* 🚨\n\n"
-            f"• Symbol: `{self.symbol.upper()}`\n"
-            f"• Threshold a(t): `{a_t:.4f}` (Limit: {self.threshold_a})\n"
-            f"• Asymmetry (C_s): `{c_sync:.4f}`\n"
-            f"• Timestamp: `{timestamp_str}`"
-        )
+        if side == "LONG":
+            price_change = (current_price - entry) / entry
+        else:
+            price_change = (entry - current_price) / entry
 
-        # Write to local alert log file
-        with open(self.alert_log, mode='a', encoding='utf-8') as f:
-            f.write(f"[{timestamp_str}] ALERT: a(t) = {a_t:.4f}\n")
+        reason = None
+        if price_change >= self.tp_pct:
+            reason = "TAKE_PROFIT"
+        elif price_change <= -self.sl_pct:
+            reason = "STOP_LOSS"
 
-        # Send via Telegram
-        self.send_telegram_message(alert_message)
-        print(" -> [Telegram Alert Sent Successfully]")
+        if reason:
+            gross_pnl = size * price_change
+            fees = size * self.fee_pct * 2  # Entry + Exit fee
+            net_pnl = gross_pnl - fees
+            self.balance += net_pnl
+            self.total_trades += 1
+            if net_pnl > 0:
+                self.winning_trades += 1
 
-    async def process_order_book(self, data: dict):
-        """Processes incoming WebSocket order book snapshots."""
+            self.log_trade(timestamp_str, side, entry, current_price, reason, net_pnl)
+            color = "\033[92m" if net_pnl > 0 else "\033[91m"
+            print(f"{color}[TRADE CLOSED] {side} | {reason} | Net PnL: {net_pnl:+.2f} USDT | Balance: {self.balance:.2f} USDT\033[0m")
+            self.position = None
+
+    async def process_order_book(self, data: dict, session: aiohttp.ClientSession):
         bids = data.get('bids', [])
         asks = data.get('asks', [])
+        if not bids or not asks:
+            return
 
-        bid_vol = sum([float(item[1]) for item in bids])
-        ask_vol = sum([float(item[1]) for item in asks])
+        # Current mid price (best Bid and best Ask)
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+        mid_price = (best_bid + best_ask) / 2.0
+
+        now_dt = datetime.now()
+        current_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        # 1. Check active positions
+        self.manage_paper_position(mid_price, current_time_str)
+
+        # 2. Compute volumes and update rolling window
+        bid_vol = sum(float(item[1]) for item in bids)
+        ask_vol = sum(float(item[1]) for item in asks)
         total_vol = bid_vol + ask_vol
+        if total_vol <= 0:
+            return
 
-        if self.baseline_depth is None and total_vol > 0:
-            self.baseline_depth = total_vol
+        self.depth_window.append(total_vol)
+        # Wait for at least 50 samples (5 seconds) for a stable baseline
+        if len(self.depth_window) < 50:
+            return
 
-        if self.baseline_depth and self.baseline_depth > 0:
-            i_depth = max(0.0, 1.0 - (total_vol / self.baseline_depth))
-            c_sync = abs(bid_vol - ask_vol) / total_vol if total_vol > 0 else 0.0
-            r_hft = min(1.0, abs(bid_vol - ask_vol) / (total_vol * 0.4)) if total_vol > 0 else 0.0
+        rolling_baseline = sum(self.depth_window) / len(self.depth_window)
 
-            w1, w2, w3 = 0.4, 0.3, 0.3
-            a_t = (w1 * i_depth) + (w2 * r_hft) + (w3 * c_sync)
+        # 3. Compute friction index a(t) and directional asymmetry
+        i_depth = max(0.0, 1.0 - (total_vol / rolling_baseline))
+        signed_asym = (bid_vol - ask_vol) / total_vol  # Positive = buying pressure, Negative = selling pressure
+        c_sync = abs(signed_asym)
+        r_hft = min(1.0, abs(bid_vol - ask_vol) / (total_vol * 0.4))
 
-            now_dt = datetime.now()
-            current_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        w1, w2, w3 = 0.4, 0.3, 0.3
+        a_t = (w1 * i_depth) + (w2 * r_hft) + (w3 * c_sync)
 
-            if a_t >= self.threshold_a:
-                status = "PANIC JAMMING"
-                self.trigger_alert(now_dt, current_time_str, a_t, c_sync)
-                print(f"\033[91m{current_time_str} | Bid: {bid_vol:.2f} | Ask: {ask_vol:.2f} | a(t): {a_t:.4f} | 🔴 {status}\033[0m")
-            else:
-                status = "NULL DRIFT"
-                print(f"{current_time_str} | Bid: {bid_vol:.2f} | Ask: {ask_vol:.2f} | a(t): {a_t:.4f} | 🟢 {status}")
+        signal = "NEUTRAL"
 
-            self.log_to_csv(current_time_str, bid_vol, ask_vol, c_sync, a_t, status)
+        # 4. Generate signal and virtual execution
+        if a_t >= self.threshold_a:
+            # Minimum asymmetry threshold (e.g., 0.25) to avoid unclear signals
+            if signed_asym > 0.25:
+                signal = "LONG"
+            elif signed_asym < -0.25:
+                signal = "SHORT"
+
+            if signal in ("LONG", "SHORT"):
+                # Open virtual position if none is currently active
+                if self.position is None:
+                    self.position = {
+                        'side': signal,
+                        'entry': mid_price,
+                        'size': self.balance  # Use full virtual balance (1x)
+                    }
+                    print(f"\033[93m[OPEN {signal}] Price: {mid_price:.2f} | a(t): {a_t:.4f} | Asym: {signed_asym:+.2f}\033[0m")
+
+                # Telegram alert with cooldown
+                if self.last_alert_time is None or (now_dt - self.last_alert_time).total_seconds() >= self.cooldown_seconds:
+                    self.last_alert_time = now_dt
+                    msg = (
+                        f"⚡ *{signal} SIGNAL DETECTED* ⚡\n\n"
+                        f"• Symbol: `{self.symbol.upper()}`\n"
+                        f"• Price: `{mid_price:.2f}`\n"
+                        f"• Index a(t): `{a_t:.4f}`\n"
+                        f"• Asymmetry: `{signed_asym:+.4f}`\n"
+                        f"• Time: `{current_time_str}`"
+                    )
+                    asyncio.create_task(self.send_telegram_message(session, msg))
+
+        # 5. Append to CSV buffer
+        self.csv_buffer.append([
+            current_time_str, self.symbol.upper(), f"{mid_price:.2f}",
+            f"{bid_vol:.2f}", f"{ask_vol:.2f}", f"{signed_asym:.4f}", f"{a_t:.4f}", signal
+        ])
+        if len(self.csv_buffer) >= self.buffer_limit:
+            self.flush_csv_buffer()
 
     async def connect(self):
-        """Establishes and maintains the persistent WebSocket connection."""
-        print(f"Starting WebSocket monitor for {self.symbol.upper()} with Cooldown ({self.cooldown_seconds}s)...\n")
-        while True:
-            try:
-                async with websockets.connect(self.ws_url) as websocket:
-                    print("[Connected to Binance WebSocket Stream]\n")
-                    async for message in websocket:
-                        data = json.loads(message)
-                        await self.process_order_book(data)
-            except Exception as e:
-                print(f"\n[Connection Error]: {e}. Reconnecting in 3 seconds...")
-                await asyncio.sleep(3)
+        print(f"Starting FrictionTradingBot on {self.symbol.upper()} | Virtual Balance: {self.balance} USDT\n")
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    async with websockets.connect(self.ws_url) as websocket:
+                        print("[Connected to Binance WebSocket Stream - Collecting liquidity baseline (5s)...]\n")
+                        async for message in websocket:
+                            data = json.loads(message)
+                            await self.process_order_book(data, session)
+                except Exception as e:
+                    print(f"\n[Connection Error]: {e}. Reconnecting in 3 seconds...")
+                    self.flush_csv_buffer()
+                    await asyncio.sleep(3)
 
 if __name__ == "__main__":
-    # Initialize monitor with a 60-second cooldown between alerts
-    monitor = TelegramFrictionMonitor(symbol="btcusdt", threshold_a=0.29213, cooldown_seconds=60)
-    
-    # monitor.use_telegram = True  # Uncomment and configure token/chat_id to enable Telegram
-    
+    bot = FrictionTradingBot(
+        symbol="btcusdt",
+        threshold_a=0.29213,
+        cooldown_seconds=30,
+        initial_balance=1000.0,
+        tp_pct=0.0025,  # 0.25% target profit
+        sl_pct=0.0015,  # 0.15% maximum stop loss
+        fee_pct=0.001   # 0.1% standard Binance Spot fee
+    )
+
     try:
-        asyncio.run(monitor.connect())
+        asyncio.run(bot.connect())
     except KeyboardInterrupt:
-        print("\n[Monitor Stopped Safely]")
+        bot.flush_csv_buffer()
+        win_rate = (bot.winning_trades / bot.total_trades * 100) if bot.total_trades > 0 else 0
+        print(f"\n[Bot Stopped] Total Trades: {bot.total_trades} | Win Rate: {win_rate:.1f}% | Final Balance: {bot.balance:.2f} USDT")
+
 
 
