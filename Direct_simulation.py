@@ -1,20 +1,20 @@
 import asyncio
-import json
 import csv
 import random
 from collections import deque
 from datetime import datetime
 
+
 class FrictionTradingSimulation:
     def __init__(
         self,
         symbol: str = "btcusdt",
-        threshold_a: float = 0.25, # Ajustat ușor jos pentru a prinde mai multe semnale în simulare scurtă
+        threshold_a: float = 0.25,  # Slightly lowered to capture more signals in a short simulation
         cooldown_seconds: int = 10,
         initial_balance: float = 1000.0,
-        tp_pct: float = 0.0025,   # Take Profit: 0.25%
-        sl_pct: float = 0.0015,   # Stop Loss: 0.15%
-        fee_pct: float = 0.001    # Binance Spot Fee: 0.1%
+        tp_pct: float = 0.0025,     # Take Profit: 0.25%
+        sl_pct: float = 0.0015,     # Stop Loss: 0.15%
+        fee_pct: float = 0.001      # Binance Spot Fee: 0.1%
     ):
         self.symbol = symbol.lower()
         self.threshold_a = threshold_a
@@ -28,13 +28,13 @@ class FrictionTradingSimulation:
         self.csv_buffer = []
         self.buffer_limit = 20
 
-        # Anti-spam
+        # Anti-spam cooldown
         self.cooldown_seconds = cooldown_seconds
         self.last_alert_time = None
 
         # Virtual Portfolio (Paper Trading)
         self.balance = initial_balance
-        self.position = None  
+        self.position = None
         self.tp_pct = tp_pct
         self.sl_pct = sl_pct
         self.fee_pct = fee_pct
@@ -66,6 +66,7 @@ class FrictionTradingSimulation:
             writer.writerow([timestamp, side, f"{entry:.2f}", f"{exit_price:.2f}", reason, f"{pnl:.4f}", f"{self.balance:.2f}"])
 
     def manage_paper_position(self, current_price: float, timestamp_str: str):
+        """Checks if the active position has reached Take Profit or Stop Loss."""
         if not self.position:
             return
 
@@ -83,7 +84,7 @@ class FrictionTradingSimulation:
 
         if reason:
             gross_pnl = size * price_change
-            fees = size * self.fee_pct * 2  
+            fees = size * self.fee_pct * 2  # Entry + Exit fee
             net_pnl = gross_pnl - fees
             self.balance += net_pnl
             self.total_trades += 1
@@ -108,10 +109,10 @@ class FrictionTradingSimulation:
         now_dt = datetime.now()
         current_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-        # 1. Verificare poziții active
+        # 1. Check active positions
         self.manage_paper_position(mid_price, current_time_str)
 
-        # 2. Calcul volume și fereastră rulantă
+        # 2. Compute volumes and update rolling window
         bid_vol = sum(float(item[1]) for item in bids)
         ask_vol = sum(float(item[1]) for item in asks)
         total_vol = bid_vol + ask_vol
@@ -119,14 +120,14 @@ class FrictionTradingSimulation:
             return
 
         self.depth_window.append(total_vol)
-        if len(self.depth_window) < 30: # Redus pentru pornire rapidă în simulare
+        if len(self.depth_window) < 30:  # Reduced threshold for a fast simulation warm-up
             return
 
         rolling_baseline = sum(self.depth_window) / len(self.depth_window)
 
-        # 3. Calcul indice de frecare a(t)
+        # 3. Compute friction index a(t) and directional asymmetry
         i_depth = max(0.0, 1.0 - (total_vol / rolling_baseline))
-        signed_asym = (bid_vol - ask_vol) / total_vol  
+        signed_asym = (bid_vol - ask_vol) / total_vol
         c_sync = abs(signed_asym)
         r_hft = min(1.0, abs(bid_vol - ask_vol) / (total_vol * 0.4))
 
@@ -135,7 +136,7 @@ class FrictionTradingSimulation:
 
         signal = "NEUTRAL"
 
-        # 4. Generare semnal și execuție virtuală
+        # 4. Generate signal and virtual execution
         if a_t >= self.threshold_a:
             if signed_asym > 0.15:
                 signal = "LONG"
@@ -147,7 +148,7 @@ class FrictionTradingSimulation:
                     self.position = {
                         'side': signal,
                         'entry': mid_price,
-                        'size': self.balance  
+                        'size': self.balance
                     }
                     print(f"\033[93m[OPEN {signal}] Price: {mid_price:.2f} | a(t): {a_t:.4f} | Asym: {signed_asym:+.2f}\033[0m")
 
@@ -155,7 +156,7 @@ class FrictionTradingSimulation:
                     self.last_alert_time = now_dt
                     print(f"⚡ [TELEGRAM MOCK ALERT] Signal: {signal} at Price: {mid_price:.2f} | Index a(t): {a_t:.4f}")
 
-        # 5. Salvare în buffer CSV
+        # 5. Append to CSV buffer
         self.csv_buffer.append([
             current_time_str, self.symbol.upper(), f"{mid_price:.2f}",
             f"{bid_vol:.2f}", f"{ask_vol:.2f}", f"{signed_asym:.4f}", f"{a_t:.4f}", signal
@@ -165,20 +166,26 @@ class FrictionTradingSimulation:
 
     async def run_simulation(self, total_steps: int = 600):
         print(f"Starting Friction Trading Simulation on {self.symbol.upper()} | Initial Balance: {self.balance} USDT\n")
-        
+
         base_price = 65000.0
         spread = 0.5
 
         for step in range(total_steps):
-            # Generare mișcare Browniană / Random Walk cu șocuri ocazionale de volum
+            # Generate Brownian motion / Random Walk with occasional volume shocks
             price_change = random.gauss(0, 3.5)
             base_price += price_change
-            
-            # Simulăm dezechilibre temporare în order book (presiune de cumpărare sau vânzare)
+
+            # Simulate temporary order book imbalances (buying or selling pressure)
             pressure_bias = random.choice([0.8, 1.0, 1.2, 1.5 if random.random() > 0.8 else 1.0])
-            
-            mock_bids = [[str(round(base_price - spread - i * 0.5, 2)), str(round(random.uniform(0.8, 6.0) * pressure_bias, 4))] for i in range(20)]
-            mock_asks = [[str(round(base_price + spread + i * 0.5, 2)), str(round(random.uniform(0.8, 6.0) * (2.0 - pressure_bias), 4))] for i in range(20)]
+
+            mock_bids = [
+                [str(round(base_price - spread - i * 0.5, 2)), str(round(random.uniform(0.8, 6.0) * pressure_bias, 4))]
+                for i in range(20)
+            ]
+            mock_asks = [
+                [str(round(base_price + spread + i * 0.5, 2)), str(round(random.uniform(0.8, 6.0) * (2.0 - pressure_bias), 4))]
+                for i in range(20)
+            ]
 
             mock_data = {
                 "bids": mock_bids,
@@ -186,13 +193,14 @@ class FrictionTradingSimulation:
             }
 
             self.process_order_book(mock_data)
-            
-            # Rulăm simulat la fiecare 0.05 secunde pentru a avansa rapid testul
+
+            # Run simulated steps every 0.05s to fast-forward the test
             await asyncio.sleep(0.05)
 
         self.flush_csv_buffer()
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
         print(f"\n[Simulation Completed] Total Trades: {self.total_trades} | Win Rate: {win_rate:.1f}% | Final Balance: {self.balance:.2f} USDT")
+
 
 if __name__ == "__main__":
     sim = FrictionTradingSimulation(
