@@ -55,36 +55,29 @@ When $a(t)$ crosses the defined threshold (`0.29213` by default) and directional
 
 ## 🚀 Quick Start
 
-
 ### 1. Clone the repository
-
 ```bash
-
 git clone https://github.com
-
-cd FrictionTradingBot
-
+cd binance-friction-monitor-
 ```
-
 
 ### 2. Install dependencies
-
 ```bash
-
 pip install websockets aiohttp
-
 ```
 
-
-### 3. Run the bot
-
+### 3. Run the live monitor (or offline simulation)
+To connect to the live Binance WebSocket stream:
 ```bash
-
-python bot.py
-
+python binance_friction_monitor.py
 ```
 
-*(Optional)* To enable Telegram alerts, set `self.use_telegram = True` and add your `TELEGRAM_TOKEN` and `CHAT_ID` in the configuration.
+To run a fast offline simulation using synthetic Random Walk order-book data (no internet or API required):
+```bash
+python Direct_simulation.py
+```
+
+*(Optional)* To enable Telegram alerts in the live bot, set `self.use_telegram = True` and add your `TELEGRAM_TOKEN` and `CHAT_ID` in `binance_friction_monitor.py`.
 
 
 ---
